@@ -1,5 +1,5 @@
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Plus,
   Search,
@@ -11,12 +11,24 @@ import {
   X,
   Package,
   Gem,
+  ImagePlus,
+  Upload,
 } from "lucide-react";
 import crmApi from "../../services/crmApi";
 import "./Products.css";
 
 const PAGE_SIZE = 10;
+const MAX_IMAGES = 12;
+const MAX_IMAGE_SIZE = 5 * 1024 * 1024;
+
 const CATEGORIES = ["Gold", "Diamond", "Silver", "NKM Nosepins"];
+
+const ALLOWED_IMAGE_TYPES = [
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/avif",
+];
 
 const emptyForm = {
   name: "",
@@ -28,7 +40,6 @@ const emptyForm = {
   purity: "",
   grossWeight: "",
   netWeight: "",
-  imageUrls: "",
   featured: false,
   isActive: true,
   showOnWebsite: true,
@@ -37,9 +48,11 @@ const emptyForm = {
 const unwrapList = (payload) => {
   if (Array.isArray(payload?.data)) return payload.data;
   if (Array.isArray(payload?.products)) return payload.products;
+
   if (Array.isArray(payload?.data?.products)) {
     return payload.data.products;
   }
+
   return [];
 };
 
@@ -48,21 +61,42 @@ const getId = (product) => product?._id || product?.id;
 const imageList = (product) =>
   Array.isArray(product?.images) ? product.images : [];
 
+const getImageUrl = (image) => {
+  if (typeof image === "string") return image;
+
+  return image?.url || image?.secure_url || "";
+};
+
 export default function Products() {
+  const fileInputRef = useRef(null);
+
   const [products, setProducts] = useState([]);
   const [search, setSearch] = useState("");
   const [category, setCategory] = useState("All categories");
   const [page, setPage] = useState(1);
+
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+
   const [modal, setModal] = useState(false);
   const [editing, setEditing] = useState(null);
+
   const [form, setForm] = useState(emptyForm);
   const [formError, setFormError] = useState("");
 
-  // Load products
+  // Existing Cloudinary image URLs retained during editing.
+  const [existingImages, setExistingImages] = useState([]);
+
+  // Newly selected local image files.
+  const [imageFiles, setImageFiles] = useState([]);
+
+  // --------------------------------------------------
+  // LOAD PRODUCTS
+  // --------------------------------------------------
+
   const loadProducts = useCallback(async () => {
     setLoading(true);
     setError("");
@@ -102,7 +136,31 @@ export default function Products() {
     loadProducts();
   }, [loadProducts]);
 
-  // Product statistics
+  // --------------------------------------------------
+  // IMAGE PREVIEW URL CLEANUP
+  // --------------------------------------------------
+
+  const imagePreviews = useMemo(
+    () =>
+      imageFiles.map((file) => ({
+        file,
+        url: URL.createObjectURL(file),
+      })),
+    [imageFiles]
+  );
+
+  useEffect(() => {
+    return () => {
+      imagePreviews.forEach((image) => {
+        URL.revokeObjectURL(image.url);
+      });
+    };
+  }, [imagePreviews]);
+
+  // --------------------------------------------------
+  // PRODUCT STATISTICS
+  // --------------------------------------------------
+
   const activeCount = products.filter(
     (product) => product.isActive !== false
   ).length;
@@ -127,17 +185,41 @@ export default function Products() {
     [products, page]
   );
 
-  // Open add product modal
+  // --------------------------------------------------
+  // RESET FORM
+  // --------------------------------------------------
+
+  const resetForm = () => {
+    setForm({ ...emptyForm });
+    setExistingImages([]);
+    setImageFiles([]);
+    setFormError("");
+
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+  };
+
+  // --------------------------------------------------
+  // OPEN ADD PRODUCT
+  // --------------------------------------------------
+
   const openAdd = () => {
     setEditing(null);
-    setForm({ ...emptyForm });
-    setFormError("");
+    resetForm();
     setModal(true);
   };
 
-  // Open edit product modal
+  // --------------------------------------------------
+  // OPEN EDIT PRODUCT
+  // --------------------------------------------------
+
   const openEdit = (product) => {
     setEditing(product);
+
+    const productImages = imageList(product)
+      .map(getImageUrl)
+      .filter(Boolean);
 
     setForm({
       name: product.name || "",
@@ -146,8 +228,6 @@ export default function Products() {
       description: product.description || "",
       brand: product.brand || "",
 
-      // Backend stores metal as a string.
-      // This also supports older object-based records.
       metalType:
         typeof product.metal === "string"
           ? product.metal
@@ -165,25 +245,26 @@ export default function Products() {
       grossWeight: product.grossWeight ?? "",
       netWeight: product.netWeight ?? "",
 
-      imageUrls: imageList(product)
-        .map((img) =>
-          typeof img === "string"
-            ? img
-            : img.url || img.secure_url || ""
-        )
-        .filter(Boolean)
-        .join("\n"),
-
       featured: Boolean(product.featured),
       isActive: product.isActive !== false,
       showOnWebsite: product.showOnWebsite !== false,
     });
 
+    setExistingImages(productImages);
+    setImageFiles([]);
     setFormError("");
+
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+
     setModal(true);
   };
 
-  // Update form fields
+  // --------------------------------------------------
+  // UPDATE FORM FIELDS
+  // --------------------------------------------------
+
   const setField = (key, value) => {
     setForm((previous) => ({
       ...previous,
@@ -191,7 +272,90 @@ export default function Products() {
     }));
   };
 
-  // Save product
+  // --------------------------------------------------
+  // SELECT PRODUCT IMAGES
+  // --------------------------------------------------
+
+  const handleImageSelection = (event) => {
+    const selectedFiles = Array.from(event.target.files || []);
+
+    setFormError("");
+
+    if (!selectedFiles.length) return;
+
+    const validFiles = [];
+
+    for (const file of selectedFiles) {
+      if (!ALLOWED_IMAGE_TYPES.includes(file.type)) {
+        setFormError(
+          `${file.name}: Only JPG, PNG, WEBP and AVIF images are allowed.`
+        );
+        continue;
+      }
+
+      if (file.size > MAX_IMAGE_SIZE) {
+        setFormError(
+          `${file.name}: Image size must not exceed 5 MB.`
+        );
+        continue;
+      }
+
+      validFiles.push(file);
+    }
+
+    const availableSlots =
+      MAX_IMAGES - existingImages.length - imageFiles.length;
+
+    if (availableSlots <= 0) {
+      setFormError(
+        `You can upload a maximum of ${MAX_IMAGES} images per product.`
+      );
+
+      event.target.value = "";
+      return;
+    }
+
+    const filesToAdd = validFiles.slice(0, availableSlots);
+
+    if (validFiles.length > availableSlots) {
+      setFormError(
+        `Only ${availableSlots} more image(s) can be added. Maximum is ${MAX_IMAGES}.`
+      );
+    }
+
+    setImageFiles((previous) => [
+      ...previous,
+      ...filesToAdd,
+    ]);
+
+    // Allow selecting the same file again after removing it.
+    event.target.value = "";
+  };
+
+  // --------------------------------------------------
+  // REMOVE EXISTING IMAGE
+  // --------------------------------------------------
+
+  const removeExistingImage = (index) => {
+    setExistingImages((previous) =>
+      previous.filter((_, imageIndex) => imageIndex !== index)
+    );
+  };
+
+  // --------------------------------------------------
+  // REMOVE NEW IMAGE
+  // --------------------------------------------------
+
+  const removeSelectedImage = (index) => {
+    setImageFiles((previous) =>
+      previous.filter((_, imageIndex) => imageIndex !== index)
+    );
+  };
+
+  // --------------------------------------------------
+  // SAVE PRODUCT USING FORMDATA
+  // --------------------------------------------------
+
   const saveProduct = async (event) => {
     event.preventDefault();
     setFormError("");
@@ -200,48 +364,49 @@ export default function Products() {
       return setFormError("Please enter the product name.");
     }
 
-    const images = form.imageUrls
-      .split(/\n|,/)
-      .map((url) => url.trim())
-      .filter(Boolean);
-
     if (
-      images.some(
-        (url) => !/^https?:\/\/.+/i.test(url)
-      )
+      existingImages.length + imageFiles.length >
+      MAX_IMAGES
     ) {
       return setFormError(
-        "Please enter valid http(s) image URLs, one per line."
+        `You can upload a maximum of ${MAX_IMAGES} images.`
       );
     }
 
-    // IMPORTANT:
+    const payload = new FormData();
+
+    payload.append("name", form.name.trim());
+    payload.append("sku", form.sku.trim());
+    payload.append("category", form.category);
+    payload.append("description", form.description.trim());
+    payload.append("brand", form.brand.trim());
+
     // Backend expects metal and purity as separate strings.
-    const payload = {
-      name: form.name.trim(),
-      sku: form.sku.trim() || undefined,
-      category: form.category,
-      description: form.description.trim(),
-      brand: form.brand.trim(),
-      images,
+    payload.append("metal", form.metalType);
+    payload.append("purity", form.purity.trim());
 
-      metal: form.metalType,
-      purity: form.purity.trim(),
+    if (form.grossWeight !== "") {
+      payload.append("grossWeight", String(Number(form.grossWeight)));
+    }
 
-      grossWeight:
-        form.grossWeight === ""
-          ? undefined
-          : Number(form.grossWeight),
+    if (form.netWeight !== "") {
+      payload.append("netWeight", String(Number(form.netWeight)));
+    }
 
-      netWeight:
-        form.netWeight === ""
-          ? undefined
-          : Number(form.netWeight),
+    payload.append("featured", String(form.featured));
+    payload.append("isActive", String(form.isActive));
+    payload.append("showOnWebsite", String(form.showOnWebsite));
 
-      featured: form.featured,
-      isActive: form.isActive,
-      showOnWebsite: form.showOnWebsite,
-    };
+    // Existing images that should remain on the product.
+    payload.append(
+      "existingImages",
+      JSON.stringify(existingImages)
+    );
+
+    // Newly selected local image files.
+    imageFiles.forEach((file) => {
+      payload.append("images", file);
+    });
 
     setSaving(true);
 
@@ -262,6 +427,8 @@ export default function Products() {
       );
 
       setModal(false);
+      resetForm();
+
       await loadProducts();
     } catch (e) {
       setFormError(
@@ -274,7 +441,10 @@ export default function Products() {
     }
   };
 
-  // Activate / deactivate product
+  // --------------------------------------------------
+  // ACTIVATE / DEACTIVATE PRODUCT
+  // --------------------------------------------------
+
   const toggleStatus = async (product) => {
     try {
       await crmApi.patch(
@@ -300,7 +470,10 @@ export default function Products() {
     }
   };
 
-  // Delete product
+  // --------------------------------------------------
+  // DELETE PRODUCT
+  // --------------------------------------------------
+
   const deleteProduct = async (product) => {
     if (
       !window.confirm(
@@ -326,14 +499,22 @@ export default function Products() {
     }
   };
 
+  // --------------------------------------------------
+  // RENDER
+  // --------------------------------------------------
+
   return (
     <div className="gh-products-page">
+      {/* PAGE HEADING */}
+
       <div className="gh-products-heading">
         <div>
           <span className="gh-products-eyebrow">
             CATALOGUE MANAGEMENT
           </span>
+
           <h1>Products</h1>
+
           <p>
             Add and manage jewellery designs displayed in
             the Gold House collection.
@@ -348,6 +529,8 @@ export default function Products() {
           Add Product
         </button>
       </div>
+
+      {/* STATISTICS */}
 
       <div className="gh-product-stats">
         <div>
@@ -369,9 +552,12 @@ export default function Products() {
         </div>
       </div>
 
+      {/* NOTIFICATIONS */}
+
       {notice && (
         <div className="gh-product-notice" role="status">
           {notice}
+
           <button
             onClick={() => setNotice("")}
             aria-label="Dismiss"
@@ -384,11 +570,14 @@ export default function Products() {
       {error && (
         <div className="gh-product-error" role="alert">
           {error}
+
           <button onClick={loadProducts}>
             Try again
           </button>
         </div>
       )}
+
+      {/* PRODUCT CATALOGUE */}
 
       <section className="gh-product-panel">
         <div className="gh-product-panel-head">
@@ -409,9 +598,12 @@ export default function Products() {
           </button>
         </div>
 
+        {/* SEARCH AND FILTER */}
+
         <div className="gh-product-toolbar">
           <label className="gh-product-search">
             <Search size={17} />
+
             <input
               value={search}
               onChange={(e) => {
@@ -430,11 +622,14 @@ export default function Products() {
             }}
           >
             <option>All categories</option>
+
             {CATEGORIES.map((item) => (
               <option key={item}>{item}</option>
             ))}
           </select>
         </div>
+
+        {/* LOADING */}
 
         {loading ? (
           <div className="gh-product-state">
@@ -445,12 +640,15 @@ export default function Products() {
             Loading products…
           </div>
         ) : visibleProducts.length === 0 ? (
+          /* EMPTY STATE */
+
           <div className="gh-product-empty">
             <div>
               <Package size={26} />
             </div>
 
             <h3>No products found</h3>
+
             <p>
               Add your first jewellery design to start
               building the catalogue.
@@ -465,6 +663,8 @@ export default function Products() {
             </button>
           </div>
         ) : (
+          /* PRODUCT TABLE */
+
           <div className="gh-product-table-wrap">
             <table className="gh-product-table">
               <thead>
@@ -481,12 +681,7 @@ export default function Products() {
               <tbody>
                 {visibleProducts.map((product) => {
                   const firstImage = imageList(product)[0];
-
-                  const imageUrl =
-                    typeof firstImage === "string"
-                      ? firstImage
-                      : firstImage?.url ||
-                        firstImage?.secure_url;
+                  const imageUrl = getImageUrl(firstImage);
 
                   return (
                     <tr key={getId(product)}>
@@ -495,7 +690,7 @@ export default function Products() {
                           {imageUrl ? (
                             <img
                               src={imageUrl}
-                              alt=""
+                              alt={product.name || "Product"}
                             />
                           ) : (
                             <span className="gh-product-placeholder">
@@ -505,6 +700,7 @@ export default function Products() {
 
                           <div>
                             <strong>{product.name}</strong>
+
                             <small>
                               {product.brand ||
                                 product.purity ||
@@ -560,9 +756,7 @@ export default function Products() {
                                 ? "Activate"
                                 : "Deactivate"
                             }
-                            onClick={() =>
-                              toggleStatus(product)
-                            }
+                            onClick={() => toggleStatus(product)}
                           >
                             {product.isActive === false ? (
                               <Eye size={16} />
@@ -574,9 +768,7 @@ export default function Products() {
                           <button
                             title="Remove product"
                             className="danger"
-                            onClick={() =>
-                              deleteProduct(product)
-                            }
+                            onClick={() => deleteProduct(product)}
                           >
                             <Trash2 size={16} />
                           </button>
@@ -589,6 +781,8 @@ export default function Products() {
             </table>
           </div>
         )}
+
+        {/* PAGINATION */}
 
         {!loading && products.length > PAGE_SIZE && (
           <div className="gh-product-pagination">
@@ -628,11 +822,13 @@ export default function Products() {
         )}
       </section>
 
+      {/* ADD / EDIT PRODUCT MODAL */}
+
       {modal && (
         <div
           className="gh-product-modal-backdrop"
           onMouseDown={(e) => {
-            if (e.target === e.currentTarget) {
+            if (e.target === e.currentTarget && !saving) {
               setModal(false);
             }
           }}
@@ -643,6 +839,8 @@ export default function Products() {
             aria-modal="true"
             aria-labelledby="gh-product-form-title"
           >
+            {/* MODAL HEADER */}
+
             <div className="gh-product-modal-head">
               <div>
                 <span className="gh-products-eyebrow">
@@ -652,15 +850,15 @@ export default function Products() {
                 </span>
 
                 <h2 id="gh-product-form-title">
-                  {editing
-                    ? "Edit product"
-                    : "Add new product"}
+                  {editing ? "Edit product" : "Add new product"}
                 </h2>
               </div>
 
               <button
-                onClick={() => setModal(false)}
+                type="button"
+                onClick={() => !saving && setModal(false)}
                 aria-label="Close"
+                disabled={saving}
               >
                 <X size={19} />
               </button>
@@ -668,8 +866,11 @@ export default function Products() {
 
             <form onSubmit={saveProduct}>
               <div className="gh-product-form-grid">
+                {/* PRODUCT NAME */}
+
                 <label className="wide">
                   Product name *
+
                   <input
                     required
                     value={form.name}
@@ -680,8 +881,11 @@ export default function Products() {
                   />
                 </label>
 
+                {/* CATEGORY */}
+
                 <label>
                   Category
+
                   <select
                     value={form.category}
                     onChange={(e) =>
@@ -694,8 +898,11 @@ export default function Products() {
                   </select>
                 </label>
 
+                {/* SKU */}
+
                 <label>
                   SKU / Product code
+
                   <input
                     value={form.sku}
                     onChange={(e) =>
@@ -705,8 +912,11 @@ export default function Products() {
                   />
                 </label>
 
+                {/* BRAND */}
+
                 <label>
                   Brand
+
                   <input
                     value={form.brand}
                     onChange={(e) =>
@@ -716,8 +926,11 @@ export default function Products() {
                   />
                 </label>
 
+                {/* METAL */}
+
                 <label>
                   Metal type
+
                   <select
                     value={form.metalType}
                     onChange={(e) =>
@@ -731,8 +944,11 @@ export default function Products() {
                   </select>
                 </label>
 
+                {/* PURITY */}
+
                 <label>
                   Purity
+
                   <input
                     value={form.purity}
                     onChange={(e) =>
@@ -742,8 +958,11 @@ export default function Products() {
                   />
                 </label>
 
+                {/* GROSS WEIGHT */}
+
                 <label>
                   Gross weight (g)
+
                   <input
                     type="number"
                     min="0"
@@ -756,8 +975,11 @@ export default function Products() {
                   />
                 </label>
 
+                {/* NET WEIGHT */}
+
                 <label>
                   Net weight (g)
+
                   <input
                     type="number"
                     min="0"
@@ -770,8 +992,11 @@ export default function Products() {
                   />
                 </label>
 
+                {/* DESCRIPTION */}
+
                 <label className="wide">
                   Description
+
                   <textarea
                     rows="3"
                     value={form.description}
@@ -782,23 +1007,129 @@ export default function Products() {
                   />
                 </label>
 
-                <label className="wide">
-                  Product image URLs
-                  <textarea
-                    rows="3"
-                    value={form.imageUrls}
-                    onChange={(e) =>
-                      setField("imageUrls", e.target.value)
-                    }
-                    placeholder="Paste image URLs, one per line"
+                {/* IMAGE UPLOAD */}
+
+                <div className="wide gh-product-image-section">
+                  <div className="gh-product-image-heading">
+                    <div>
+                      <strong>Product images</strong>
+
+                      <small>
+                        Upload up to {MAX_IMAGES} images. JPG, PNG,
+                        WEBP or AVIF. Maximum 5 MB per image.
+                      </small>
+                    </div>
+
+                    <span>
+                      {existingImages.length + imageFiles.length}/
+                      {MAX_IMAGES}
+                    </span>
+                  </div>
+
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept="image/jpeg,image/png,image/webp,image/avif"
+                    multiple
+                    hidden
+                    onChange={handleImageSelection}
                   />
-                  <small>
-                    Use publicly accessible https image links.
-                    Image upload can be connected when the
-                    backend storage provider is configured.
-                  </small>
-                </label>
+
+                  <button
+                    type="button"
+                    className="gh-product-upload-button"
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={
+                      saving ||
+                      existingImages.length + imageFiles.length >=
+                        MAX_IMAGES
+                    }
+                  >
+                    <ImagePlus size={20} />
+
+                    <span>
+                      <strong>Select product images</strong>
+                      <small>
+                        Choose images from your computer
+                      </small>
+                    </span>
+
+                    <Upload size={18} />
+                  </button>
+
+                  {/* IMAGE PREVIEWS */}
+
+                  {(existingImages.length > 0 ||
+                    imagePreviews.length > 0) && (
+                    <div className="gh-product-image-grid">
+                      {existingImages.map((image, index) => (
+                        <div
+                          className="gh-product-image-card"
+                          key={`existing-${image}-${index}`}
+                        >
+                          <img
+                            src={image}
+                            alt={`Existing product ${index + 1}`}
+                          />
+
+                          <span className="gh-product-image-label">
+                            Saved image
+                          </span>
+
+                          <button
+                            type="button"
+                            onClick={() =>
+                              removeExistingImage(index)
+                            }
+                            disabled={saving}
+                            aria-label="Remove existing image"
+                            title="Remove image"
+                          >
+                            <X size={15} />
+                          </button>
+                        </div>
+                      ))}
+
+                      {imagePreviews.map((image, index) => (
+                        <div
+                          className="gh-product-image-card"
+                          key={`${image.file.name}-${index}`}
+                        >
+                          <img
+                            src={image.url}
+                            alt={`New product ${index + 1}`}
+                          />
+
+                          <span className="gh-product-image-label new">
+                            New image
+                          </span>
+
+                          <button
+                            type="button"
+                            onClick={() =>
+                              removeSelectedImage(index)
+                            }
+                            disabled={saving}
+                            aria-label="Remove selected image"
+                            title="Remove image"
+                          >
+                            <X size={15} />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {existingImages.length === 0 &&
+                    imageFiles.length === 0 && (
+                      <p className="gh-product-no-images">
+                        No images selected yet.
+                      </p>
+                    )}
+                </div>
               </div>
+
+              {/* PRODUCT OPTIONS */}
 
               <div className="gh-product-options">
                 <label>
@@ -838,11 +1169,15 @@ export default function Products() {
                 </label>
               </div>
 
+              {/* PRICE NOTE */}
+
               <div className="gh-product-price-note">
                 Public catalogue uses{" "}
                 <strong>Enquiry only</strong>. Product prices
                 are not collected or displayed here.
               </div>
+
+              {/* FORM ERROR */}
 
               {formError && (
                 <div className="gh-product-error" role="alert">
@@ -850,11 +1185,16 @@ export default function Products() {
                 </div>
               )}
 
+              {/* FORM BUTTONS */}
+
               <div className="gh-product-form-actions">
                 <button
                   type="button"
                   className="gh-product-secondary"
-                  onClick={() => setModal(false)}
+                  onClick={() => {
+                    if (!saving) setModal(false);
+                  }}
+                  disabled={saving}
                 >
                   Cancel
                 </button>
@@ -865,7 +1205,7 @@ export default function Products() {
                   disabled={saving}
                 >
                   {saving
-                    ? "Saving…"
+                    ? "Uploading and saving…"
                     : editing
                       ? "Save changes"
                       : "Save product"}

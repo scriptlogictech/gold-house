@@ -1,3 +1,4 @@
+
 const multer = require("multer");
 
 const storage = multer.memoryStorage();
@@ -14,6 +15,7 @@ const fileFilter = (req, file, callback) => {
     const error = new Error(
       "Only JPG, PNG, WEBP and AVIF images are allowed."
     );
+
     error.status = 400;
     return callback(error);
   }
@@ -38,7 +40,6 @@ const uploadProductImages = (req, res, next) => {
     }
 
     try {
-      // Existing image URLs can be retained during product editing.
       const existingImages =
         req.body.existingImages ?? req.body.images;
 
@@ -49,19 +50,23 @@ const uploadProductImages = (req, res, next) => {
             : existingImages;
 
         if (!Array.isArray(parsed)) {
-          throw new Error("Existing images must be an array.");
+          throw new Error(
+            "Existing images must be an array."
+          );
         }
 
         req.body.images = parsed;
-      } else {
-        req.body.images = [];
       }
+
+      // Do not assign an empty array here.
+      // The controller will preserve existing database images.
 
       next();
     } catch (parseError) {
       parseError.status = 400;
       parseError.message =
         "Invalid existing images data. Send a JSON array of image URLs.";
+
       next(parseError);
     }
   });
